@@ -71,6 +71,8 @@
 // point. 
 #define FAN_SPEED_TRANSITION_TIME_MS 100 
 
+const char* STATUS_JSON_FORMAT = "{\n  \"status\":%d,\n  \"command\":\"%c\",\n  \"state\":\"%c\",\n  \"freeMem\":%d,  \"wiFiStatus\":%d, \n}\n";
+
 WebServer server(80);
 
 // External command to the unit
@@ -145,17 +147,28 @@ void setup() {
         Serial.println(((command == COOL) ? "COOL" : "OFF"));
       }
     }
-    String statusJson = "{\n";
-    statusJson += "\"status\":";
-    statusJson += (command == OFF ? "0" : "1"); 
-    statusJson += "\n}";
-    server.send(200, "text/json", statusJson);
+    char* buffer = (char *)malloc(1024 * sizeof(char));  
+    sprintf(buffer, STATUS_JSON_FORMAT, (command == OFF ? 0 : 1), command, state, getFreeHeap(), WiFi.status());
+    server.send(200, "text/json", buffer);
+    free(buffer); 
   });
 
   server.onNotFound(handleNotFound);
   server.begin();
   Serial.println("HTTP server started");
 
+}
+
+uint32_t getTotalHeap(void) {
+   extern char __StackLimit, __bss_end__;
+   
+   return &__StackLimit  - &__bss_end__;
+}
+
+uint32_t getFreeHeap(void) {
+   struct mallinfo m = mallinfo();
+
+   return getTotalHeap() - m.uordblks;
 }
 
 void loop() {
@@ -181,7 +194,7 @@ void wifi_connect() {
 
     WiFi.disconnect(true); 
 
-    delay(1000);
+    delay(10000);
 
     Serial.print("Connecting to ");
     Serial.println(WIFI_SSID);
