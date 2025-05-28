@@ -46,9 +46,19 @@
 #include <float.h>
 #include <math.h>
 #include "DS18B20.h"
+#include <CPU.h>
 #include "config.h"
+extern "C" {
+  #include "threadkernel.h"
+}
 
 #define TEMP_SENSOR_PIN 2
+#define MAX_TEMP_C 60.0
+#define MIN_TEMP_C -40.0
+
+#define PING_INTERVAL_MS 10000
+#define SENSOR_READ_INTERVAL_MS 5000
+#define MAX_CONSECUTIVE_FAILED_PINGS 5
 
 // Active high outputs
 #define COMPRESSOR_PIN 10
@@ -77,13 +87,13 @@
 // point.
 #define FAN_SPEED_TRANSITION_TIME_MS 100
 
-#define COOL_HIGH_OFF_TEMP_C  2
+#define COOL_HIGH_OFF_TEMP_C  1.5
 #define COOL_HIGH_ON_TEMP_C 6
 
 #define COOL_MED_OFF_TEMP_C   5
 #define COOL_MED_ON_TEMP_C  12
 
-#define COOL_LOW_OFF_TEMP_C  10
+#define COOL_LOW_OFF_TEMP_C  8
 #define COOL_LOW_ON_TEMP_C  17
 
 #define EVAP_TEMP_ADDR   61
@@ -96,18 +106,26 @@
 #define NUM_SENSORS 2
 
 DS18B20 ds(TEMP_SENSOR_PIN);
+CPU cpu; 
 
 const char* STATUS_JSON_FORMAT = 
             "{\n"\
             "  \"evapTempC\":\"%f\",\n" \
             "  \"outletTempC\":\"%f\",\n" \
-            "  \"uptime\":%d,\n" \
-            "  \"connected\":%d,\n" \
             "  \"command\":\"%c\",\n" \
             "  \"state\":\"%c\",\n" \
             "  \"compressorState\":\"%d\",\n" \
             "  \"fanState\":\"%c\",\n" \
+            "  \"cpuTempC\":\"%f\",\n" \
+            "  \"tempErrors\":%d,\n" \
+            "  \"lastPing\":\"%fms\",\n" \
+            "  \"consecutiveFailedPings\":%d,\n" \
             "  \"freeMem\":%d,\n" \
+            "  \"powered\":\"%s\",\n" \
+            "  \"booted\":\"%s\",\n" \
+            "  \"connected\":\"%s\",\n" \
+            "  \"numRebootsPingFailed\":%d,\n" \
+            "  \"numRebootsDisconnected\":%d,\n" \
             "  \"wiFiStatus\":%d\n" \
             "}\n";
 const pin_size_t TEMP_SENSOR_ADDRESSES[(NUM_SENSORS)] = {EVAP_TEMP_ADDR, OUTLET_TEMP_ADDR};
@@ -149,20 +167,47 @@ typedef enum {
   COMPRESSOR_ON
 } compressor_state_t;
 
-// Governed by external input
-volatile ac_cmd_t command = CMD_OFF;
 
 // Internal states
 volatile ac_state_t state = POWER_OFF;
 volatile compressor_state_t compressorState = COMPRESSOR_OFF;
 volatile fan_state_t fanState = FAN_OFF;
 
+static volatile long            initialize             __attribute__((section(".uninitialized_data")));
+static volatile long            timeBaseMs             __attribute__((section(".uninitialized_data")));
+static volatile long            powerUpTime            __attribute__((section(".uninitialized_data")));
+static volatile long            tempErrors             __attribute__((section(".uninitialized_data")));
+static volatile long            numRebootsPingFailed   __attribute__((section(".uninitialized_data")));
+static volatile long            numRebootsDisconnected __attribute__((section(".uninitialized_data")));
+static volatile ac_cmd_t        command                __attribute__((section(".uninitialized_data")));
+
 volatile long lastStateChangeTimeMs = millis();
 volatile long startupTime = millis();
 volatile long connectTime = millis();
+volatile unsigned long lastPingMicros = 0; 
+volatile unsigned int consecutiveFailedPings = 0; 
+
+threadkernel_t* CORE_0_KERNEL; 
+threadkernel_t* CORE_1_KERNEL;
 
 void setup() {
   Serial.setDebugOutput(false);
+
+  CORE_0_KERNEL = create_threadkernel(&millis); 
+  CORE_1_KERNEL = create_threadkernel(&millis); 
+
+  if (initialize)
+  {
+    timeBaseMs = 0; 
+    powerUpTime = millis(); 
+    tempErrors = 0; 
+    command = CMD_OFF;
+    numRebootsPingFailed = 0; 
+    numRebootsDisconnected = 0; 
+    initialize = 0; 
+  }
+
+  cpu.begin(); 
 
   wifi_connect();
 
@@ -193,96 +238,53 @@ void setup() {
         }
       }
     }
-    char* buffer = (char*)malloc(1024 * sizeof(char));
-    sprintf(buffer, STATUS_JSON_FORMAT,
-            TEMPERATURES_C[EVAP_IDX],
-            TEMPERATURES_C[OUTLET_IDX],
-            (millis() - startupTime),
-            (millis() - connectTime),
-            command,
-            state,
-            compressorState,
-            fanState,
-            getFreeHeap(),
-            WiFi.status());
-    server.send(200, "text/json", buffer);
-    free(buffer);
+    {
+      char* buffer = (char*)malloc(1024 * sizeof(char));
+      {
+        unsigned long timeMs = millis(); 
+        char* poweredTimeStr = msToHumanReadableTime((timeBaseMs + timeMs) - powerUpTime); 
+        char* bootedTimeStr = msToHumanReadableTime(timeMs - startupTime); 
+        char* connectedTimeStr = msToHumanReadableTime(timeMs - connectTime); 
+        sprintf(buffer, STATUS_JSON_FORMAT,
+                TEMPERATURES_C[EVAP_IDX],
+                TEMPERATURES_C[OUTLET_IDX],
+                command,
+                state,
+                compressorState,
+                fanState,
+                cpu.getTemperature(),
+                tempErrors,
+                lastPingMicros/1000.0,
+                consecutiveFailedPings,
+                getFreeHeap(),
+                poweredTimeStr, 
+                bootedTimeStr,
+                connectedTimeStr,
+                numRebootsPingFailed,
+                numRebootsDisconnected, 
+                WiFi.status());
+        free(poweredTimeStr); 
+        free(bootedTimeStr); 
+        free(connectedTimeStr); 
+      }
+      server.send(200, "text/json", buffer);
+      free(buffer);
+    }
   });
 
   server.onNotFound(handleNotFound);
   server.begin();
   Serial.println("HTTP server started");
+
+  CORE_0_KERNEL->add(CORE_0_KERNEL, task_mdnsUpdate, 1000); 
+  CORE_0_KERNEL->add(CORE_0_KERNEL, task_testPing, PING_INTERVAL_MS); 
+  CORE_0_KERNEL->add(CORE_0_KERNEL, task_testWiFiConnection, 100); 
+  CORE_0_KERNEL->add(CORE_0_KERNEL, task_handleClient, 0); 
 }
 
-void loop() {
-  // put your main code here, to run repeatedly:
-  if (!is_wifi_connected()) {
-    wifi_connect();
-  }
-
-  server.handleClient();
-  MDNS.update();
-  delay(100);
-}
-
-bool is_wifi_connected() {
-  return WiFi.status() == WL_CONNECTED;
-}
-
-void wifi_connect() {
-  // Must reset the wi-fi hardware each time it disconnects to ensure a reliable connection
-  int attempts = 10;
-  while (!is_wifi_connected() && (attempts--)) {
-    Serial.print("Wi-fi status: ");
-    Serial.println(WiFi.status());
-
-    WiFi.disconnect(true);
-
-    delay(10000);
-
-    Serial.print("Connecting to ");
-    Serial.println(WIFI_SSID);
-
-    WiFi.mode(WIFI_STA);
-    WiFi.noLowPowerMode();
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    delay(10000);
-  }
-
-  if (!is_wifi_connected()) {
-    Serial.print("Connect failed! Rebooting.");
-    rp2040.reboot();
-  }
-
-  Serial.println("Connected");
-  Serial.print("Connected to ");
-  Serial.println(WiFi.SSID());
-
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
-
-  Serial.print("Hostname: ");
-  Serial.print(HOSTNAME);
-  Serial.println(".local");
-
-  connectTime = millis();
-}
-
-void handleNotFound() {
-  String message = "File Not Found\n\n";
-  message += "URI: ";
-  message += server.uri();
-  message += "\nMethod: ";
-  message += (server.method() == HTTP_GET) ? "GET" : "POST";
-  message += "\nArguments: ";
-  message += server.args();
-  message += "\n";
-
-  for (uint8_t i = 0; i < server.args(); i++) {
-    message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
-  }
-
-  server.send(404, "text/plain", message);
+void loop() 
+{
+  CORE_0_KERNEL->run(CORE_0_KERNEL); 
 }
 
 void setup1() {
@@ -297,27 +299,75 @@ void setup1() {
 
   pinMode(FAN_HIGH_PIN, OUTPUT);
   digitalWrite(FAN_HIGH_PIN, LOW);
+
+  CORE_1_KERNEL->add(CORE_1_KERNEL, readTemperatures, SENSOR_READ_INTERVAL_MS); 
+  CORE_1_KERNEL->add(CORE_1_KERNEL, task_processCommans, 0); 
 }
 
-void loop1() {
-  readTemperatures(); 
+void loop1()
+{
+  CORE_1_KERNEL->run(CORE_1_KERNEL); 
+}
 
-  // Detect icing and stop cooling if detected. 
-  if (!isEvaporatorInSafeTempRange())
+void task_handleClient()
+{
+  server.handleClient(); 
+}
+
+void task_mdnsUpdate()
+{
+  MDNS.update(); 
+}
+
+void task_testWiFiConnection()
+{
+  if (!is_wifi_connected()) 
   {
-    setCompressor(COMPRESSOR_OFF); 
-    Serial.println("Compressor in hold off due to unsafe temperatures."); 
-    delay(20 * 1000); 
+    Serial.println("WiFi disconnected, rebooting.");
+    numRebootsDisconnected++; 
+    reboot();  
   }
+}
+
+void task_testPing()
+{
+  unsigned long timeMicros = micros(); 
+  int pingStatus = WiFi.ping(WiFi.gatewayIP(), 255); 
+  lastPingMicros = micros() - timeMicros; 
+  if (pingStatus < 0) 
+  {
+    if (++consecutiveFailedPings >= MAX_CONSECUTIVE_FAILED_PINGS)
+    {
+      Serial.println("Gateway unresponsive, rebooting.");
+      numRebootsPingFailed++; 
+      reboot(); 
+    }
+  }
+  else 
+  {
+    consecutiveFailedPings = 0; 
+  }
+}
+
+void task_processCommans()
+{
+  state = processCommand(state, command);
+}
+
+void task_readTemperatures()
+{
+  readTemperatures(); 
 
   for (int i = 0; i < NUM_SENSORS; i++)
   {
     Serial.printf("%s: %fC\r\n", SENSOR_NAMES[i], TEMPERATURES_C[i]);
   }
+}
 
-  state = processCommand(state, command);
-
-  delay(1000);
+void reboot()
+{
+  timeBaseMs += millis(); 
+  rp2040.reboot(); 
 }
 
 ac_state_t changeState(const ac_state_t currentState, const ac_state_t targetState) {
@@ -376,10 +426,9 @@ int isEvaporatorInSafeTempRange()
   switch(compressorState) 
   {
     case COMPRESSOR_ON: return 
-        (TEMPERATURES_C[EVAP_IDX] > 10.0 && TEMPERATURES_C[OUTLET_IDX] > 1.0)
-        || TEMPERATURES_C[EVAP_IDX] > TEMPERATURES_C[OUTLET_IDX];
+        TEMPERATURES_C[EVAP_IDX] > 12.0 && TEMPERATURES_C[OUTLET_IDX] > 0.5;
     case COMPRESSOR_OFF: return 
-        TEMPERATURES_C[EVAP_IDX] > 10.0 && TEMPERATURES_C[OUTLET_IDX] > 1.0;
+        TEMPERATURES_C[EVAP_IDX] > 14.0 && TEMPERATURES_C[OUTLET_IDX] > 5.0;
     default: return 1; 
   }
 }
@@ -526,19 +575,80 @@ void controlCompressorState(float offTempC, float onTempC)
   {
     case COMPRESSOR_ON: 
     {
-      if (TEMPERATURES_C[OUTLET_IDX] <= offTempC)
+      if (TEMPERATURES_C[OUTLET_IDX] <= offTempC || !isEvaporatorInSafeTempRange())
         setCompressor(COMPRESSOR_OFF); 
       break; 
     }
     case COMPRESSOR_OFF: 
     {
-      if (TEMPERATURES_C[OUTLET_IDX] >= onTempC)
+      if (TEMPERATURES_C[OUTLET_IDX] >= onTempC && isEvaporatorInSafeTempRange())
         setCompressor(COMPRESSOR_ON); 
       break; 
     }
   }
 }
 
+// WiFi
+
+// WIFI
+
+bool is_wifi_connected() 
+{
+  return WiFi.status() == WL_CONNECTED;
+}
+
+void wifi_connect() 
+{
+  WiFi.noLowPowerMode();
+  Serial.print("Connecting to ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.noLowPowerMode();
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  int attempts = 20;
+  while (!is_wifi_connected() && (attempts--)) 
+  {
+    delay(1000);
+  }
+
+  if (!is_wifi_connected()) {
+    Serial.print("Connect failed! Rebooting.");
+    numRebootsDisconnected++; 
+    reboot(); 
+  }
+
+  Serial.println("Connected");
+  Serial.print("Connected to ");
+  Serial.println(WiFi.SSID());
+
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  Serial.print("Hostname: ");
+  Serial.print(HOSTNAME);
+  Serial.println(".local");
+
+  connectTime = millis();
+}
+
+void handleNotFound() {
+  String message = "File Not Found\n\n";
+  message += "URI: ";
+  message += server.uri();
+  message += "\nMethod: ";
+  message += (server.method() == HTTP_GET) ? "GET" : "POST";
+  message += "\nArguments: ";
+  message += server.args();
+  message += "\n";
+
+  for (uint8_t i = 0; i < server.args(); i++) {
+    message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
+  }
+
+  server.send(404, "text/plain", message);
+}
 
 // TEMP SENSORS
 
@@ -546,152 +656,64 @@ int isTempCValid(float tempC)
 {
   return tempC != INVALID_TEMP
     && tempC == tempC 
-    && tempC < 40 
-    && tempC > -40; 
-}
-
-
-int waitForTemperatures()
-{
-  Serial.println("Wait for sensors"); 
-  Serial.println(" "); 
-  char padding[] = "============================";
-  int ready = 0; 
-  for(int retry = 0; retry < 12 && !ready; retry++) 
-  {
-    delay(5000); 
-    
-    ready = 1; 
-    for (int i = 0; i < NUM_SENSORS; i++)
-    {
-        if (TEMPERATURES_C[i] == INVALID_TEMP)
-        {
-          Serial.printf("... %s\r\n", SENSOR_NAMES[i]); 
-          ready = 0; 
-          break;
-        } 
-        else 
-        {
-          Serial.printf("[OK] %s\r\n", SENSOR_NAMES[i]); 
-        }
-    }
-  }
-
-  if (ready)
-  {
-    Serial.printf("Sensors ready!\r\n");
-  }
-  else 
-  {
-    Serial.printf("Sensors not ready\r\n");
-  }
-
-  return ready; 
-}
-
-int countSensors() 
-{
-  int count = 0;
-  while (ds.selectNext()) count++;
-  return count;
-}
-
-int getSensorData(int* address, float* tempC, int nSensors) {
-  int i = 0;
-  while (ds.selectNext()) {
-    if (i < nSensors) {
-      uint8_t sensorAddress[8];
-      ds.getAddress(sensorAddress);
-      address[i] = sensorAddress[7];
-      tempC[i] = ds.getTempC();
-    }
-
-    i++;
-  }
-
-  return i;
-}
-
-float getTempC(int requestedAddress, int* address, float* tempC, int nSensors)
-{
-  int i;
-  for (i = 0; i < nSensors; i++) 
-  {
-    if (requestedAddress == address[i])
-    {
-      float tmpTempC = tempC[i];
-
-      if (tmpTempC == tmpTempC)
-      {
-        return tmpTempC; 
-      }
-    }
-  }
-
-  return INVALID_TEMP;
-}
-
-void updateTemperature(int requestedAddress, int* address, float* tempC, int nSensors, volatile float* currentTempC)
-{
-  float newTempC = getTempC(requestedAddress, address, tempC, nSensors); 
-
-  if (newTempC != INVALID_TEMP && newTempC == newTempC)
-  {
-    *currentTempC = newTempC; 
-  }
+    && tempC < MAX_TEMP_C 
+    && tempC > MIN_TEMP_C; 
 }
 
 void readTemperatures() 
 {
-  int nSensors = countSensors();
-  int* address = (int*)malloc(nSensors * sizeof(int));
-  float* tempC = (float*)malloc(nSensors * sizeof(float));
-  nSensors = getSensorData(address, tempC, nSensors);
+  printSensorAddresses(); 
+
+  int nSensors = ds.getNumberOfDevices(); 
+  float newTempC[256]; 
+
+  for (int i = 0; i < 256; i++) { newTempC[i] = INVALID_TEMP; }
+  
+  while (ds.selectNext())
+  {
+    uint8_t sensorAddress[8];
+    ds.getAddress(sensorAddress);
+    float reading1C = ds.getTempC(); 
+    float reading2C = ds.getTempC(); 
+    float diff = fabs(reading1C - reading2C); 
+    if (diff < 0.1 && isTempCValid(reading1C))
+    {
+      newTempC[sensorAddress[7]] = reading1C; 
+    }
+    else 
+    {
+      Serial.printf("TEMP ERROR: %f %f\r\n", reading1C, reading2C); 
+      tempErrors++; 
+    }
+  }
+  
   for (int i = 0; i < NUM_SENSORS; i++)
   {
-    int valid = 0; 
-    float previousTempC = 0; 
-    float newTempC = TEMPERATURES_C[i]; 
-    do {
-      previousTempC = newTempC; 
-      updateTemperature(TEMP_SENSOR_ADDRESSES[i], address, tempC, nSensors, &(newTempC));
-      int significantChange = newTempC != INVALID_TEMP && (int)(previousTempC * 1.0) != (int)(newTempC * 1.0); 
-      valid = isTempCValid(newTempC) && !significantChange; 
-      if (!valid)
-      {
-        Serial.printf("Invalid temperature change: %f to %f; resampling\r\n", previousTempC, newTempC); 
-        delay(5000); 
-        nSensors = getSensorData(address, tempC, nSensors);
-      }
-    } while(!valid); 
-    TEMPERATURES_C[i] = newTempC; 
+    if (newTempC[TEMP_SENSOR_ADDRESSES[i]] != INVALID_TEMP)
+    {
+      TEMPERATURES_C[i] = newTempC[TEMP_SENSOR_ADDRESSES[i]]; 
+    }
   }
-  free(address);
-  free(tempC);
 }
 
 /* Reads temperature sensors */
 void printSensorAddresses()
 {
-  int nSensors = countSensors();
+  int nSensors = ds.getNumberOfDevices();
   if (nSensors == 0)
   {
     Serial.println("No sensors detected"); 
     return; 
   }
 
-  int* address = (int*)malloc(nSensors * sizeof(int));
-  float* tempC = (float*)malloc(nSensors * sizeof(float));
   char buffer[1024]; 
-  nSensors = getSensorData(address, tempC, nSensors);
   buffer[0] = 0; 
-  for (int i = 0; i < nSensors; i++)
-  {
-      sprintf(buffer + strlen(buffer), "%d ", address[i]); 
+  while (ds.selectNext()) {
+    uint8_t sensorAddress[8];
+    ds.getAddress(sensorAddress);
+    sprintf(buffer + strlen(buffer), "%d ", sensorAddress[7]); 
   }
   Serial.println(buffer); 
-  free(address);
-  free(tempC);
 }
 
 // Heap 
@@ -706,5 +728,41 @@ uint32_t getFreeHeap(void) {
   struct mallinfo m = mallinfo();
 
   return getTotalHeap() - m.uordblks;
+}
+
+// Util 
+
+char *msToHumanReadableTime(long timeMs)
+{
+  char buffer[1024]; 
+
+  if (timeMs < 1000)
+  {
+    sprintf(buffer, "%dms", timeMs);
+  }
+  else if (timeMs < 60 * 1000)
+  {
+    sprintf(buffer, "%5.2fs", timeMs / 1000.0);
+  }
+  else if (timeMs < 60 * 60 * 1000)
+  {
+    sprintf(buffer, "%5.2fm", timeMs / (60.0 * 1000.0));
+  }
+  else if (timeMs < 24 * 60 * 60 * 1000)
+  {
+    sprintf(buffer, "%5.2fh", timeMs / (60.0 * 60.0 * 1000.0));
+  }
+  else
+  {
+    sprintf(buffer, "%5.2fd", timeMs / (24.0 * 60.0 * 60.0 * 1000.0));
+  }
+
+  int allocChars = strlen(buffer) + 1; 
+
+  char *formattedString = (char *)malloc(allocChars * sizeof(char)); 
+
+  strcpy(formattedString, buffer); 
+
+  return formattedString; 
 }
 
