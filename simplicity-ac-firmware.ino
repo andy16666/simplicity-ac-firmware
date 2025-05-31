@@ -45,16 +45,18 @@
 #include <stdint.h>
 #include <float.h>
 #include <math.h>
-#include "DS18B20.h"
+#include <TemperatureSensors.h>
 #include <CPU.h>
 #include "config.h"
+#include <SimplicityAC.h>
+#include <util.h>
 extern "C" {
   #include "threadkernel.h"
 }
 
+using namespace AOS; 
+
 #define TEMP_SENSOR_PIN 2
-#define MAX_TEMP_C 60.0
-#define MIN_TEMP_C -40.0
 
 #define PING_INTERVAL_MS 10000
 #define SENSOR_READ_INTERVAL_MS 5000
@@ -99,79 +101,36 @@ extern "C" {
 #define EVAP_TEMP_ADDR   61
 #define OUTLET_TEMP_ADDR 20
 
-#define INVALID_TEMP FLT_MIN
-
-#define EVAP_IDX    0
-#define OUTLET_IDX  1
-#define NUM_SENSORS 2
-
-DS18B20 ds(TEMP_SENSOR_PIN);
 CPU cpu; 
 
 const char* STATUS_JSON_FORMAT = 
-            "{\n"\
-            "  \"evapTempC\":\"%f\",\n" \
-            "  \"outletTempC\":\"%f\",\n" \
-            "  \"command\":\"%c\",\n" \
-            "  \"state\":\"%c\",\n" \
-            "  \"compressorState\":\"%d\",\n" \
-            "  \"fanState\":\"%c\",\n" \
-            "  \"cpuTempC\":\"%f\",\n" \
-            "  \"tempErrors\":%d,\n" \
-            "  \"lastPing\":\"%fms\",\n" \
-            "  \"consecutiveFailedPings\":%d,\n" \
-            "  \"freeMem\":%d,\n" \
-            "  \"powered\":\"%s\",\n" \
-            "  \"booted\":\"%s\",\n" \
-            "  \"connected\":\"%s\",\n" \
-            "  \"numRebootsPingFailed\":%d,\n" \
-            "  \"numRebootsDisconnected\":%d,\n" \
-            "  \"wiFiStatus\":%d\n" \
-            "}\n";
-const pin_size_t TEMP_SENSOR_ADDRESSES[(NUM_SENSORS)] = {EVAP_TEMP_ADDR, OUTLET_TEMP_ADDR};
-float            TEMPERATURES_C[(NUM_SENSORS)]    = {INVALID_TEMP, INVALID_TEMP};
-const char*      SENSOR_NAMES[(NUM_SENSORS)] = {"Evap", "Outlet"}; 
+          "{\n"\
+          "  \"evapTempC\":\"%s\",\n" \
+          "  \"outletTempC\":\"%s\",\n" \
+          "  \"command\":\"%c\",\n" \
+          "  \"state\":\"%c\",\n" \
+          "  \"compressorState\":\"%d\",\n" \
+          "  \"fanState\":\"%c\",\n" \
+          "  \"cpuTempC\":\"%f\",\n" \
+          "  \"tempErrors\":%d,\n" \
+          "  \"lastPing\":\"%fms\",\n" \
+          "  \"consecutiveFailedPings\":%d,\n" \
+          "  \"freeMem\":%d,\n" \
+          "  \"powered\":\"%s\",\n" \
+          "  \"booted\":\"%s\",\n" \
+          "  \"connected\":\"%s\",\n" \
+          "  \"numRebootsPingFailed\":%d,\n" \
+          "  \"numRebootsDisconnected\":%d,\n" \
+          "  \"wiFiStatus\":%d\n" \
+          "}\n";
 
 WebServer server(80);
-
-// External command to the unit
-typedef enum {
-  CMD_OFF = '-',
-  CMD_COOL_HIGH = 'C',
-  CMD_COOL_MED  = 'M',
-  CMD_COOL_LOW  = 'L',
-  CMD_KILL = 'K',
-  CMD_FAN = 'F'
-} ac_cmd_t;
-
-// A/C state is changed based on the external command and the current state.
-typedef enum {
-  POWER_OFF = '-',
-  COOL_HIGH = 'H',
-  COOL_MED  = 'M',
-  COOL_LOW  = 'L',
-  STANDBY_HIGH = 'h',
-  STANDBY_MED  = 'm',
-  STANDBY_LOW  = 'l',
-} ac_state_t;
-
-typedef enum {
-  FAN_OFF = '-',
-  FAN_LOW = 'L',
-  FAN_MED = 'M',
-  FAN_HIGH = 'H'
-} fan_state_t;
-
-typedef enum {
-  COMPRESSOR_OFF,
-  COMPRESSOR_ON
-} compressor_state_t;
-
+TemperatureSensors TEMPERATURES(TEMP_SENSOR_PIN); 
 
 // Internal states
-volatile ac_state_t state = POWER_OFF;
-volatile compressor_state_t compressorState = COMPRESSOR_OFF;
-volatile fan_state_t fanState = FAN_OFF;
+volatile ac_state_t state = AC_POWER_OFF;
+volatile compressor_state_t compressorState = AC_COMPRESSOR_OFF;
+volatile fan_state_t fanState = AC_FAN_OFF;
 
 static volatile long            initialize             __attribute__((section(".uninitialized_data")));
 static volatile long            timeBaseMs             __attribute__((section(".uninitialized_data")));
@@ -201,7 +160,7 @@ void setup() {
     timeBaseMs = 0; 
     powerUpTime = millis(); 
     tempErrors = 0; 
-    command = CMD_OFF;
+    command = CMD_AC_OFF;
     numRebootsPingFailed = 0; 
     numRebootsDisconnected = 0; 
     initialize = 0; 
@@ -210,8 +169,6 @@ void setup() {
   cpu.begin(); 
 
   wifi_connect();
-
-  printSensorAddresses();
 
   server.begin();
 
@@ -227,14 +184,14 @@ void setup() {
       if (argName.equals("cmd") && arg.length() == 1) {
         switch(arg.charAt(0))
         {
-          case 'O':  command = CMD_OFF;  break;
-          case 'C':  command = CMD_COOL_HIGH; break;  
-          case 'H':  command = CMD_COOL_HIGH; break;  
-          case 'M':  command = CMD_COOL_MED; break;  
-          case 'L':  command = CMD_COOL_LOW; break;  
-          case 'K':  command = CMD_KILL; break;  
-          case 'F':  command = CMD_FAN;  break; 
-          default:   command = CMD_OFF;  
+          case 'O':  command = CMD_AC_OFF;  break;
+          case 'C':  command = CMD_AC_COOL_HIGH; break;  
+          case 'H':  command = CMD_AC_COOL_HIGH; break;  
+          case 'M':  command = CMD_AC_COOL_MED; break;  
+          case 'L':  command = CMD_AC_COOL_LOW; break;  
+          case 'K':  command = CMD_AC_KILL; break;  
+          case 'F':  command = CMD_AC_FAN;  break; 
+          default:   command = CMD_AC_OFF;  
         }
       }
     }
@@ -246,8 +203,8 @@ void setup() {
         char* bootedTimeStr = msToHumanReadableTime(timeMs - startupTime); 
         char* connectedTimeStr = msToHumanReadableTime(timeMs - connectTime); 
         sprintf(buffer, STATUS_JSON_FORMAT,
-                TEMPERATURES_C[EVAP_IDX],
-                TEMPERATURES_C[OUTLET_IDX],
+                TEMPERATURES.formatTempC(EVAP_TEMP_ADDR).c_str(),
+                TEMPERATURES.formatTempC(OUTLET_TEMP_ADDR).c_str(),
                 command,
                 state,
                 compressorState,
@@ -276,7 +233,8 @@ void setup() {
   server.begin();
   Serial.println("HTTP server started");
 
-  CORE_0_KERNEL->add(CORE_0_KERNEL, task_mdnsUpdate, 1000); 
+  CORE_0_KERNEL->addImmediate(CORE_0_KERNEL, task_mdnsUpdate); 
+
   CORE_0_KERNEL->add(CORE_0_KERNEL, task_testPing, PING_INTERVAL_MS); 
   CORE_0_KERNEL->add(CORE_0_KERNEL, task_testWiFiConnection, 100); 
   CORE_0_KERNEL->add(CORE_0_KERNEL, task_handleClient, 0); 
@@ -287,7 +245,12 @@ void loop()
   CORE_0_KERNEL->run(CORE_0_KERNEL); 
 }
 
-void setup1() {
+void setup1() 
+{
+  TEMPERATURES.add("Evap", EVAP_TEMP_ADDR); 
+  TEMPERATURES.add("Outlet", OUTLET_TEMP_ADDR); 
+  TEMPERATURES.discoverSensors();
+
   pinMode(COMPRESSOR_PIN, OUTPUT);
   digitalWrite(COMPRESSOR_PIN, LOW);
 
@@ -300,8 +263,9 @@ void setup1() {
   pinMode(FAN_HIGH_PIN, OUTPUT);
   digitalWrite(FAN_HIGH_PIN, LOW);
 
-  CORE_1_KERNEL->add(CORE_1_KERNEL, readTemperatures, SENSOR_READ_INTERVAL_MS); 
-  CORE_1_KERNEL->add(CORE_1_KERNEL, task_processCommans, 0); 
+  CORE_1_KERNEL->addImmediate(CORE_1_KERNEL, task_processCommans); 
+
+  CORE_1_KERNEL->add(CORE_1_KERNEL, task_readTemperatures, SENSOR_READ_INTERVAL_MS);
 }
 
 void loop1()
@@ -356,12 +320,7 @@ void task_processCommans()
 
 void task_readTemperatures()
 {
-  readTemperatures(); 
-
-  for (int i = 0; i < NUM_SENSORS; i++)
-  {
-    Serial.printf("%s: %fC\r\n", SENSOR_NAMES[i], TEMPERATURES_C[i]);
-  }
+  TEMPERATURES.readSensors();
 }
 
 void reboot()
@@ -375,43 +334,43 @@ ac_state_t changeState(const ac_state_t currentState, const ac_state_t targetSta
     Serial.printf("changeState: %c => %c\r\n", currentState, targetState);
 
     switch (targetState) {
-      case COOL_HIGH:
+      case AC_COOL_HIGH:
         {
-          setFan(FAN_HIGH);
+          setFan(AC_FAN_HIGH);
           break;
         }
-      case COOL_MED:
+      case AC_COOL_MED:
         {
-          setFan(FAN_MED);
+          setFan(AC_FAN_MED);
           break;
         }
-      case COOL_LOW:
+      case AC_COOL_LOW:
         {
-          setFan(FAN_LOW);
+          setFan(AC_FAN_LOW);
           break;
         }
-      case STANDBY_HIGH:
+      case AC_STANDBY_HIGH:
         {
-          setCompressor(COMPRESSOR_OFF);
-          setFan(FAN_HIGH);
+          setCompressor(AC_COMPRESSOR_OFF);
+          setFan(AC_FAN_HIGH);
           break;
         }
-      case STANDBY_MED:
+      case AC_STANDBY_MED:
         {
-          setCompressor(COMPRESSOR_OFF);
-          setFan(FAN_MED);
+          setCompressor(AC_COMPRESSOR_OFF);
+          setFan(AC_FAN_MED);
           break;
         }
-      case STANDBY_LOW:
+      case AC_STANDBY_LOW:
         {
-          setCompressor(COMPRESSOR_OFF);
-          setFan(FAN_LOW);
+          setCompressor(AC_COMPRESSOR_OFF);
+          setFan(AC_FAN_LOW);
           break;
         }
-      case POWER_OFF:
+      case AC_POWER_OFF:
         {
-          setCompressor(COMPRESSOR_OFF);
-          setFan(FAN_OFF);
+          setCompressor(AC_COMPRESSOR_OFF);
+          setFan(AC_FAN_OFF);
           break;
         }
     }
@@ -425,10 +384,10 @@ int isEvaporatorInSafeTempRange()
 {
   switch(compressorState) 
   {
-    case COMPRESSOR_ON: return 
-        TEMPERATURES_C[EVAP_IDX] > 12.0 && TEMPERATURES_C[OUTLET_IDX] > 0.5;
-    case COMPRESSOR_OFF: return 
-        TEMPERATURES_C[EVAP_IDX] > 14.0 && TEMPERATURES_C[OUTLET_IDX] > 5.0;
+    case AC_COMPRESSOR_ON: return 
+        TEMPERATURES.getTempC(EVAP_TEMP_ADDR) > 12.0 && TEMPERATURES.getTempC(OUTLET_TEMP_ADDR) > 0.5;
+    case AC_COMPRESSOR_OFF: return 
+        TEMPERATURES.getTempC(EVAP_TEMP_ADDR) > 14.0 && TEMPERATURES.getTempC(OUTLET_TEMP_ADDR) > 5.0;
     default: return 1; 
   }
 }
@@ -436,10 +395,10 @@ int isEvaporatorInSafeTempRange()
 float calculateOnTemp(float stateOffTempC, float stateOnTempC, float minRangeC, float minEvapDeltaC, float maxEvapDeltaC)
 {
   // If the state on temp is larger than the evap temp, we are unlikely to ever cool. Adjust it to just under. 
-  float maxOnTempC = fmin(TEMPERATURES_C[EVAP_IDX] - minEvapDeltaC, stateOnTempC);
+  float maxOnTempC = fmin(TEMPERATURES.getTempC(EVAP_TEMP_ADDR) - minEvapDeltaC, stateOnTempC);
 
   // If we try to start with too large a delta, the compressor will see huge torque and fail to operate. 
-  float minOnTempC = fmax(TEMPERATURES_C[EVAP_IDX] - maxEvapDeltaC, stateOffTempC + minRangeC); 
+  float minOnTempC = fmax(TEMPERATURES.getTempC(EVAP_TEMP_ADDR) - maxEvapDeltaC, stateOffTempC + minRangeC); 
 
   if (maxOnTempC > minOnTempC)
   {
@@ -451,75 +410,76 @@ float calculateOnTemp(float stateOffTempC, float stateOnTempC, float minRangeC, 
   }
 }
 
-ac_state_t processCommand(const ac_state_t currentState, const ac_cmd_t command) {
+ac_state_t processCommand(const ac_state_t currentState, const ac_cmd_t command) 
+{
   ac_state_t newState = currentState;
   switch (command) 
   {
-    case CMD_COOL_HIGH:
+    case CMD_AC_COOL_HIGH:
     {
       float onTempC = calculateOnTemp(COOL_HIGH_OFF_TEMP_C, COOL_HIGH_ON_TEMP_C, 5.0, 5.0, 8.0);
 
       // Move to STANDBY_HIGH, then to COOL_HIGH.
       switch (currentState) 
       {
-        case STANDBY_HIGH: newState = COOL_HIGH; break;
-        case COOL_HIGH: controlCompressorState(COOL_HIGH_OFF_TEMP_C, onTempC); break;
-        default: newState = STANDBY_HIGH; break;
+        case AC_STANDBY_HIGH: newState = AC_COOL_HIGH; break;
+        case AC_COOL_HIGH: controlCompressorState(COOL_HIGH_OFF_TEMP_C, onTempC); break;
+        default: newState = AC_STANDBY_HIGH; break;
       }
       break;
     }
-    case CMD_COOL_MED:
+    case CMD_AC_COOL_MED:
     {
       float onTempC = calculateOnTemp(COOL_MED_OFF_TEMP_C, COOL_MED_ON_TEMP_C, 5.0, 2.0, 7.0);
 
       // Move to STANDBY_HIGH, then to COOL_HIGH.
       switch (currentState) 
       {
-        case STANDBY_MED: newState = COOL_MED; break;
-        case COOL_MED: controlCompressorState(COOL_MED_OFF_TEMP_C, onTempC); break;
-        default: newState = STANDBY_MED; break;
+        case AC_STANDBY_MED: newState = AC_COOL_MED; break;
+        case AC_COOL_MED: controlCompressorState(COOL_MED_OFF_TEMP_C, onTempC); break;
+        default: newState = AC_STANDBY_MED; break;
       }
       break;
     }
-    case CMD_COOL_LOW:
+    case CMD_AC_COOL_LOW:
     {
       float onTempC = calculateOnTemp(COOL_LOW_OFF_TEMP_C, COOL_LOW_ON_TEMP_C, 5.0, 1.0, 5.0);
 
       // Move to STANDBY_HIGH, then to COOL_HIGH.
       switch (currentState) 
       {
-        case STANDBY_LOW: newState = COOL_LOW; break;
-        case COOL_LOW: controlCompressorState(COOL_LOW_OFF_TEMP_C, onTempC); break;
-        default: newState = STANDBY_LOW; break;
+        case AC_STANDBY_LOW: newState = AC_COOL_LOW; break;
+        case AC_COOL_LOW: controlCompressorState(COOL_LOW_OFF_TEMP_C, onTempC); break;
+        default: newState = AC_STANDBY_LOW; break;
       }
       break;
     }
-    case CMD_OFF:
+    case CMD_AC_OFF:
     {
       long elapsedStateTimeMs = millis() - lastStateChangeTimeMs;
       switch (currentState) 
       {
-        case COOL_HIGH: newState = STANDBY_HIGH; break;
-        case COOL_MED:  newState = STANDBY_MED;  break;
-        case COOL_LOW:  newState = STANDBY_LOW;  break;
-        case STANDBY_HIGH: newState = elapsedStateTimeMs > STANDBY_HIGH_TIME_MS ? STANDBY_MED : currentState; break;
-        case STANDBY_MED:  newState = elapsedStateTimeMs > STANDBY_MED_TIME_MS  ? STANDBY_LOW : currentState; break;
-        case STANDBY_LOW:  newState = elapsedStateTimeMs > STANDBY_LOW_TIME_MS  ? POWER_OFF   : currentState; break;
+        case AC_COOL_HIGH: newState = AC_STANDBY_HIGH; break;
+        case AC_COOL_MED:  newState = AC_STANDBY_MED;  break;
+        case AC_COOL_LOW:  newState = AC_STANDBY_LOW;  break;
+        case AC_STANDBY_HIGH: newState = elapsedStateTimeMs > STANDBY_HIGH_TIME_MS ? AC_STANDBY_MED : currentState; break;
+        case AC_STANDBY_MED:  newState = elapsedStateTimeMs > STANDBY_MED_TIME_MS  ? AC_STANDBY_LOW : currentState; break;
+        case AC_STANDBY_LOW:  newState = elapsedStateTimeMs > STANDBY_LOW_TIME_MS  ? AC_POWER_OFF   : currentState; break;
       }
       break;
     }
-    case CMD_KILL: 
+    case CMD_AC_KILL: 
     {
       switch (currentState) 
       {
-        case COOL_HIGH: newState = STANDBY_HIGH; break;
-        case COOL_MED:  newState = STANDBY_MED;  break;
-        case COOL_LOW:  newState = STANDBY_LOW;  break;
-        default: newState = POWER_OFF; break;
+        case AC_COOL_HIGH: newState = AC_STANDBY_HIGH; break;
+        case AC_COOL_MED:  newState = AC_STANDBY_MED;  break;
+        case AC_COOL_LOW:  newState = AC_STANDBY_LOW;  break;
+        default: newState = AC_POWER_OFF; break;
       }
       break; 
     }
-    case CMD_FAN: newState = STANDBY_HIGH; break;
+    case CMD_AC_FAN: newState = AC_STANDBY_HIGH; break;
   }
 
   if (newState != currentState) {
@@ -530,24 +490,28 @@ ac_state_t processCommand(const ac_state_t currentState, const ac_cmd_t command)
   return newState;
 }
 
-void setFan(const fan_state_t targetState) {
-  if (targetState != fanState) {
+void setFan(const fan_state_t targetState) 
+{
+  if (targetState != fanState) 
+  {
     // Turn off the currently energized winding, if any
-    switch (fanState) {
-      case FAN_LOW: digitalWrite(FAN_LOW_PIN, LOW); break;
-      case FAN_MED: digitalWrite(FAN_MED_PIN, LOW); break;
-      case FAN_HIGH: digitalWrite(FAN_HIGH_PIN, LOW); break;
+    switch (fanState) 
+    {
+      case AC_FAN_LOW:  digitalWrite(FAN_LOW_PIN, LOW); break;
+      case AC_FAN_MED:  digitalWrite(FAN_MED_PIN, LOW); break;
+      case AC_FAN_HIGH: digitalWrite(FAN_HIGH_PIN, LOW); break;
     }
 
     // If transitioning from another on state, delay a brief time to allow the winding to de-energize.
-    if (fanState != FAN_OFF && targetState != FAN_OFF)
+    if (fanState != AC_FAN_OFF && targetState != AC_FAN_OFF)
       delay(FAN_SPEED_TRANSITION_TIME_MS);
 
     // Energize the traget winding, if any
-    switch (targetState) {
-      case FAN_LOW: digitalWrite(FAN_LOW_PIN, HIGH); break;
-      case FAN_MED: digitalWrite(FAN_MED_PIN, HIGH); break;
-      case FAN_HIGH: digitalWrite(FAN_HIGH_PIN, HIGH); break;
+    switch (targetState) 
+    {
+      case AC_FAN_LOW: digitalWrite(FAN_LOW_PIN, HIGH); break;
+      case AC_FAN_MED: digitalWrite(FAN_MED_PIN, HIGH); break;
+      case AC_FAN_HIGH: digitalWrite(FAN_HIGH_PIN, HIGH); break;
     }
 
     Serial.printf("setFan: %c => %c\r\n", fanState, targetState);
@@ -556,11 +520,14 @@ void setFan(const fan_state_t targetState) {
   }
 }
 
-void setCompressor(const compressor_state_t targetState) {
-  if (targetState != compressorState) {
-    switch (targetState) {
-      case COMPRESSOR_ON:  digitalWrite(COMPRESSOR_PIN, HIGH); break;
-      case COMPRESSOR_OFF: digitalWrite(COMPRESSOR_PIN, LOW); break;
+void setCompressor(const compressor_state_t targetState) 
+{
+  if (targetState != compressorState) 
+  {
+    switch (targetState) 
+    {
+      case AC_COMPRESSOR_ON:  digitalWrite(COMPRESSOR_PIN, HIGH); break;
+      case AC_COMPRESSOR_OFF: digitalWrite(COMPRESSOR_PIN, LOW); break;
     }
 
     Serial.printf("setCompressor: %d => %d\r\n", compressorState, targetState);
@@ -573,16 +540,16 @@ void controlCompressorState(float offTempC, float onTempC)
 {
   switch(compressorState) 
   {
-    case COMPRESSOR_ON: 
+    case AC_COMPRESSOR_ON: 
     {
-      if (TEMPERATURES_C[OUTLET_IDX] <= offTempC || !isEvaporatorInSafeTempRange())
-        setCompressor(COMPRESSOR_OFF); 
+      if (TEMPERATURES.getTempC(OUTLET_TEMP_ADDR) <= offTempC || !isEvaporatorInSafeTempRange())
+        setCompressor(AC_COMPRESSOR_OFF); 
       break; 
     }
-    case COMPRESSOR_OFF: 
+    case AC_COMPRESSOR_OFF: 
     {
-      if (TEMPERATURES_C[OUTLET_IDX] >= onTempC && isEvaporatorInSafeTempRange())
-        setCompressor(COMPRESSOR_ON); 
+      if (TEMPERATURES.getTempC(OUTLET_TEMP_ADDR) >= onTempC && isEvaporatorInSafeTempRange())
+        setCompressor(AC_COMPRESSOR_ON); 
       break; 
     }
   }
@@ -650,72 +617,6 @@ void handleNotFound() {
   server.send(404, "text/plain", message);
 }
 
-// TEMP SENSORS
-
-int isTempCValid(float tempC) 
-{
-  return tempC != INVALID_TEMP
-    && tempC == tempC 
-    && tempC < MAX_TEMP_C 
-    && tempC > MIN_TEMP_C; 
-}
-
-void readTemperatures() 
-{
-  printSensorAddresses(); 
-
-  int nSensors = ds.getNumberOfDevices(); 
-  float newTempC[256]; 
-
-  for (int i = 0; i < 256; i++) { newTempC[i] = INVALID_TEMP; }
-  
-  while (ds.selectNext())
-  {
-    uint8_t sensorAddress[8];
-    ds.getAddress(sensorAddress);
-    float reading1C = ds.getTempC(); 
-    float reading2C = ds.getTempC(); 
-    float diff = fabs(reading1C - reading2C); 
-    if (diff < 0.1 && isTempCValid(reading1C))
-    {
-      newTempC[sensorAddress[7]] = reading1C; 
-    }
-    else 
-    {
-      Serial.printf("TEMP ERROR: %f %f\r\n", reading1C, reading2C); 
-      tempErrors++; 
-    }
-  }
-  
-  for (int i = 0; i < NUM_SENSORS; i++)
-  {
-    if (newTempC[TEMP_SENSOR_ADDRESSES[i]] != INVALID_TEMP)
-    {
-      TEMPERATURES_C[i] = newTempC[TEMP_SENSOR_ADDRESSES[i]]; 
-    }
-  }
-}
-
-/* Reads temperature sensors */
-void printSensorAddresses()
-{
-  int nSensors = ds.getNumberOfDevices();
-  if (nSensors == 0)
-  {
-    Serial.println("No sensors detected"); 
-    return; 
-  }
-
-  char buffer[1024]; 
-  buffer[0] = 0; 
-  while (ds.selectNext()) {
-    uint8_t sensorAddress[8];
-    ds.getAddress(sensorAddress);
-    sprintf(buffer + strlen(buffer), "%d ", sensorAddress[7]); 
-  }
-  Serial.println(buffer); 
-}
-
 // Heap 
 
 uint32_t getTotalHeap(void) {
@@ -728,41 +629,5 @@ uint32_t getFreeHeap(void) {
   struct mallinfo m = mallinfo();
 
   return getTotalHeap() - m.uordblks;
-}
-
-// Util 
-
-char *msToHumanReadableTime(long timeMs)
-{
-  char buffer[1024]; 
-
-  if (timeMs < 1000)
-  {
-    sprintf(buffer, "%dms", timeMs);
-  }
-  else if (timeMs < 60 * 1000)
-  {
-    sprintf(buffer, "%5.2fs", timeMs / 1000.0);
-  }
-  else if (timeMs < 60 * 60 * 1000)
-  {
-    sprintf(buffer, "%5.2fm", timeMs / (60.0 * 1000.0));
-  }
-  else if (timeMs < 24 * 60 * 60 * 1000)
-  {
-    sprintf(buffer, "%5.2fh", timeMs / (60.0 * 60.0 * 1000.0));
-  }
-  else
-  {
-    sprintf(buffer, "%5.2fd", timeMs / (24.0 * 60.0 * 60.0 * 1000.0));
-  }
-
-  int allocChars = strlen(buffer) + 1; 
-
-  char *formattedString = (char *)malloc(allocChars * sizeof(char)); 
-
-  strcpy(formattedString, buffer); 
-
-  return formattedString; 
 }
 
