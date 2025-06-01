@@ -149,11 +149,9 @@ volatile unsigned int consecutiveFailedPings = 0;
 threadkernel_t* CORE_0_KERNEL; 
 threadkernel_t* CORE_1_KERNEL;
 
-void setup() {
+void setup() 
+{
   Serial.setDebugOutput(false);
-
-  CORE_0_KERNEL = create_threadkernel(&millis); 
-  CORE_1_KERNEL = create_threadkernel(&millis); 
 
   if (initialize)
   {
@@ -165,6 +163,9 @@ void setup() {
     numRebootsDisconnected = 0; 
     initialize = 0; 
   }
+
+  CORE_0_KERNEL = create_threadkernel(&millis); 
+  CORE_1_KERNEL = create_threadkernel(&millis); 
 
   cpu.begin(); 
 
@@ -196,36 +197,27 @@ void setup() {
       }
     }
     {
-      char* buffer = (char*)malloc(1024 * sizeof(char));
-      {
-        unsigned long timeMs = millis(); 
-        char* poweredTimeStr = msToHumanReadableTime((timeBaseMs + timeMs) - powerUpTime); 
-        char* bootedTimeStr = msToHumanReadableTime(timeMs - startupTime); 
-        char* connectedTimeStr = msToHumanReadableTime(timeMs - connectTime); 
-        sprintf(buffer, STATUS_JSON_FORMAT,
-                TEMPERATURES.formatTempC(EVAP_TEMP_ADDR).c_str(),
-                TEMPERATURES.formatTempC(OUTLET_TEMP_ADDR).c_str(),
-                command,
-                state,
-                compressorState,
-                fanState,
-                cpu.getTemperature(),
-                tempErrors,
-                lastPingMicros/1000.0,
-                consecutiveFailedPings,
-                getFreeHeap(),
-                poweredTimeStr, 
-                bootedTimeStr,
-                connectedTimeStr,
-                numRebootsPingFailed,
-                numRebootsDisconnected, 
-                WiFi.status());
-        free(poweredTimeStr); 
-        free(bootedTimeStr); 
-        free(connectedTimeStr); 
-      }
+      char buffer[1024];
+      unsigned long timeMs = millis(); 
+      sprintf(buffer, STATUS_JSON_FORMAT,
+              TEMPERATURES.formatTempC(EVAP_TEMP_ADDR).c_str(),
+              TEMPERATURES.formatTempC(OUTLET_TEMP_ADDR).c_str(),
+              command,
+              state,
+              compressorState,
+              fanState,
+              cpu.getTemperature(),
+              tempErrors,
+              lastPingMicros/1000.0,
+              consecutiveFailedPings,
+              getFreeHeap(),
+              msToHumanReadableTime((timeBaseMs + timeMs) - powerUpTime).c_str(), 
+              msToHumanReadableTime(timeMs - startupTime).c_str(),
+              msToHumanReadableTime(timeMs - connectTime).c_str(),
+              numRebootsPingFailed,
+              numRebootsDisconnected, 
+              WiFi.status());
       server.send(200, "text/json", buffer);
-      free(buffer);
     }
   });
 
@@ -580,7 +572,8 @@ void wifi_connect()
     delay(1000);
   }
 
-  if (!is_wifi_connected()) {
+  if (!is_wifi_connected()) 
+  {
     Serial.print("Connect failed! Rebooting.");
     numRebootsDisconnected++; 
     reboot(); 
@@ -610,24 +603,10 @@ void handleNotFound() {
   message += server.args();
   message += "\n";
 
-  for (uint8_t i = 0; i < server.args(); i++) {
+  for (uint8_t i = 0; i < server.args(); i++) 
+  {
     message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
   }
 
   server.send(404, "text/plain", message);
 }
-
-// Heap 
-
-uint32_t getTotalHeap(void) {
-  extern char __StackLimit, __bss_end__;
-
-  return &__StackLimit - &__bss_end__;
-}
-
-uint32_t getFreeHeap(void) {
-  struct mallinfo m = mallinfo();
-
-  return getTotalHeap() - m.uordblks;
-}
-
