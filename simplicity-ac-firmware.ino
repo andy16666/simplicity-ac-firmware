@@ -37,30 +37,24 @@
   Author: Andrew Somerville <andy16666@gmail.com> 
   GitHub: andy16666
 */
-
-#include <LEAmDNS.h>
-#include <WebServer.h>
-#include <WiFi.h>
-#include <WiFiClient.h>
 #include <stdint.h>
 #include <float.h>
 #include <math.h>
-#include <TemperatureSensors.h>
+#include <string.h>
+
 #include <CPU.h>
-#include "config.h"
-#include <SimplicityAC.h>
-#include <util.h>
-extern "C" {
-  #include "threadkernel.h"
-}
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <WiFi.h>
+#include <WiFiClient.h>
+
+#include <aos.h>
+#include <config.h>
+#include <GPIOOutputs.h>
+#include <Thermostats.h>
+#include <SimplicityAC.h> 
 
 using namespace AOS; 
-
-#define TEMP_SENSOR_PIN 2
-
-#define PING_INTERVAL_MS 10000
-#define SENSOR_READ_INTERVAL_MS 5000
-#define MAX_CONSECUTIVE_FAILED_PINGS 5
 
 // Active high outputs
 #define COMPRESSOR_PIN 10
@@ -101,83 +95,34 @@ using namespace AOS;
 #define EVAP_TEMP_ADDR   61
 #define OUTLET_TEMP_ADDR 20
 
-CPU cpu; 
-
-const char* STATUS_JSON_FORMAT = 
-          "{\n"\
-          "  \"evapTempC\":\"%s\",\n" \
-          "  \"outletTempC\":\"%s\",\n" \
-          "  \"command\":\"%c\",\n" \
-          "  \"state\":\"%c\",\n" \
-          "  \"compressorState\":\"%d\",\n" \
-          "  \"fanState\":\"%c\",\n" \
-          "  \"cpuTempC\":\"%f\",\n" \
-          "  \"tempErrors\":%d,\n" \
-          "  \"lastPing\":\"%fms\",\n" \
-          "  \"consecutiveFailedPings\":%d,\n" \
-          "  \"freeMem\":%d,\n" \
-          "  \"powered\":\"%s\",\n" \
-          "  \"booted\":\"%s\",\n" \
-          "  \"connected\":\"%s\",\n" \
-          "  \"numRebootsPingFailed\":%d,\n" \
-          "  \"numRebootsDisconnected\":%d,\n" \
-          "  \"wiFiStatus\":%d\n" \
-          "}\n";
-
 WebServer server(80);
-TemperatureSensors TEMPERATURES(TEMP_SENSOR_PIN); 
+SimplicityAC acData(AC_HOSTNAME);
 
 // Internal states
 volatile ac_state_t state = AC_POWER_OFF;
 volatile compressor_state_t compressorState = AC_COMPRESSOR_OFF;
 volatile fan_state_t fanState = AC_FAN_OFF;
 
-static volatile long            initialize             __attribute__((section(".uninitialized_data")));
-static volatile long            timeBaseMs             __attribute__((section(".uninitialized_data")));
-static volatile long            powerUpTime            __attribute__((section(".uninitialized_data")));
-static volatile long            tempErrors             __attribute__((section(".uninitialized_data")));
-static volatile long            numRebootsPingFailed   __attribute__((section(".uninitialized_data")));
-static volatile long            numRebootsDisconnected __attribute__((section(".uninitialized_data")));
 static volatile ac_cmd_t        command                __attribute__((section(".uninitialized_data")));
 
 volatile long lastStateChangeTimeMs = millis();
-volatile long startupTime = millis();
-volatile long connectTime = millis();
-volatile unsigned long lastPingMicros = 0; 
-volatile unsigned int consecutiveFailedPings = 0; 
 
-threadkernel_t* CORE_0_KERNEL; 
-threadkernel_t* CORE_1_KERNEL;
-
-void setup() 
+const char* generateHostname()
 {
-  Serial.setDebugOutput(false);
+  return "ac1"; 
+}
 
-  if (initialize)
-  {
-    timeBaseMs = 0; 
-    powerUpTime = millis(); 
-    tempErrors = 0; 
-    command = CMD_AC_OFF;
-    numRebootsPingFailed = 0; 
-    numRebootsDisconnected = 0; 
-    initialize = 0; 
-  }
+void aosInitialize()
+{
+  command = CMD_AC_OFF;
+}
 
-  CORE_0_KERNEL = create_threadkernel(&millis); 
-  CORE_1_KERNEL = create_threadkernel(&millis); 
-
-  cpu.begin(); 
-
-  wifi_connect();
-
+void aosSetup() 
+{
   server.begin();
-
-  if (MDNS.begin(HOSTNAME)) {
-    Serial.println("MDNS responder started");
-  }
-
   server.on("/", []() {
+    bool success = true;
+
     for (uint8_t i = 0; i < server.args(); i++) {
       String argName = server.argName(i);
       String arg = server.arg(i);
@@ -185,39 +130,46 @@ void setup()
       if (argName.equals("cmd") && arg.length() == 1) {
         switch(arg.charAt(0))
         {
+          case '-':  command = CMD_AC_OFF;  break;
           case 'O':  command = CMD_AC_OFF;  break;
           case 'C':  command = CMD_AC_COOL_HIGH; break;  
           case 'H':  command = CMD_AC_COOL_HIGH; break;  
           case 'M':  command = CMD_AC_COOL_MED; break;  
           case 'L':  command = CMD_AC_COOL_LOW; break;  
           case 'K':  command = CMD_AC_KILL; break;  
-          case 'F':  command = CMD_AC_FAN;  break; 
-          default:   command = CMD_AC_OFF;  
+          case 'F':  command = CMD_AC_FAN_HIGH;  break; 
+          case 'm':  command = CMD_AC_FAN_MED;  break; 
+          case 'l':  command = CMD_AC_FAN_LOW;  break; 
+          default:   success = false;  
+        }
+      }
+
+      if (argName.equals("bootloader") && arg.length() == 1) 
+      {
+        switch(arg.charAt(0))
+        {
+          case 'A':  rp2040.rebootToBootloader();  break;
+          default:   success = false;  
+        }
+      }
+
+      if (argName.equals("reboot") && arg.length() == 1) 
+      {
+        switch(arg.charAt(0))
+        {
+          case 'A':  reboot(); break;
+          default:   success = false;  
         }
       }
     }
+
+    if (success)
     {
-      char buffer[1024];
-      unsigned long timeMs = millis(); 
-      sprintf(buffer, STATUS_JSON_FORMAT,
-              TEMPERATURES.formatTempC(EVAP_TEMP_ADDR).c_str(),
-              TEMPERATURES.formatTempC(OUTLET_TEMP_ADDR).c_str(),
-              command,
-              state,
-              compressorState,
-              fanState,
-              cpu.getTemperature(),
-              tempErrors,
-              lastPingMicros/1000.0,
-              consecutiveFailedPings,
-              getFreeHeap(),
-              msToHumanReadableTime((timeBaseMs + timeMs) - powerUpTime).c_str(), 
-              msToHumanReadableTime(timeMs - startupTime).c_str(),
-              msToHumanReadableTime(timeMs - connectTime).c_str(),
-              numRebootsPingFailed,
-              numRebootsDisconnected, 
-              WiFi.status());
-      server.send(200, "text/json", buffer);
+      server.send(200, "text/json", httpResponseString);
+    }
+    else 
+    {
+      server.send(500, "text/plain", "Failed to parse request.");
     }
   });
 
@@ -225,23 +177,13 @@ void setup()
   server.begin();
   Serial.println("HTTP server started");
 
-  CORE_0_KERNEL->addImmediate(CORE_0_KERNEL, task_mdnsUpdate); 
-
-  CORE_0_KERNEL->add(CORE_0_KERNEL, task_testPing, PING_INTERVAL_MS); 
-  CORE_0_KERNEL->add(CORE_0_KERNEL, task_testWiFiConnection, 100); 
-  CORE_0_KERNEL->add(CORE_0_KERNEL, task_handleClient, 0); 
+  CORE_0_KERNEL->addImmediate(CORE_0_KERNEL, task_handleClient); 
 }
 
-void loop() 
+void aosSetup1() 
 {
-  CORE_0_KERNEL->run(CORE_0_KERNEL); 
-}
-
-void setup1() 
-{
-  TEMPERATURES.add("Evap", EVAP_TEMP_ADDR); 
-  TEMPERATURES.add("Outlet", OUTLET_TEMP_ADDR); 
-  TEMPERATURES.discoverSensors();
+  TEMPERATURES.add("Evap", "evapTempC", EVAP_TEMP_ADDR); 
+  TEMPERATURES.add("Outlet", "outletTempC", OUTLET_TEMP_ADDR); 
 
   pinMode(COMPRESSOR_PIN, OUTPUT);
   digitalWrite(COMPRESSOR_PIN, LOW);
@@ -255,14 +197,15 @@ void setup1()
   pinMode(FAN_HIGH_PIN, OUTPUT);
   digitalWrite(FAN_HIGH_PIN, LOW);
 
-  CORE_1_KERNEL->addImmediate(CORE_1_KERNEL, task_processCommans); 
-
-  CORE_1_KERNEL->add(CORE_1_KERNEL, task_readTemperatures, SENSOR_READ_INTERVAL_MS);
+  CORE_1_KERNEL->addImmediate(CORE_1_KERNEL, task_processCommands);  
 }
 
-void loop1()
+void populateHttpResponse(JSONVar& document) 
 {
-  CORE_1_KERNEL->run(CORE_1_KERNEL); 
+  document["command"] = String((char)command).c_str(); 
+  document["state"] = String((char)state).c_str(); 
+  document["fanState"] = String((char)fanState).c_str(); 
+  document["compressorState"] = String((int)compressorState).c_str(); 
 }
 
 void task_handleClient()
@@ -270,58 +213,13 @@ void task_handleClient()
   server.handleClient(); 
 }
 
-void task_mdnsUpdate()
-{
-  MDNS.update(); 
-}
-
-void task_testWiFiConnection()
-{
-  if (!is_wifi_connected()) 
-  {
-    Serial.println("WiFi disconnected, rebooting.");
-    numRebootsDisconnected++; 
-    reboot();  
-  }
-}
-
-void task_testPing()
-{
-  unsigned long timeMicros = micros(); 
-  int pingStatus = WiFi.ping(WiFi.gatewayIP(), 255); 
-  lastPingMicros = micros() - timeMicros; 
-  if (pingStatus < 0) 
-  {
-    if (++consecutiveFailedPings >= MAX_CONSECUTIVE_FAILED_PINGS)
-    {
-      Serial.println("Gateway unresponsive, rebooting.");
-      numRebootsPingFailed++; 
-      reboot(); 
-    }
-  }
-  else 
-  {
-    consecutiveFailedPings = 0; 
-  }
-}
-
-void task_processCommans()
+void task_processCommands()
 {
   state = processCommand(state, command);
 }
 
-void task_readTemperatures()
+ac_state_t changeState(const ac_state_t currentState, const ac_state_t targetState) 
 {
-  TEMPERATURES.readSensors();
-}
-
-void reboot()
-{
-  timeBaseMs += millis(); 
-  rp2040.reboot(); 
-}
-
-ac_state_t changeState(const ac_state_t currentState, const ac_state_t targetState) {
   if (targetState != currentState) {
     Serial.printf("changeState: %c => %c\r\n", currentState, targetState);
 
@@ -341,19 +239,19 @@ ac_state_t changeState(const ac_state_t currentState, const ac_state_t targetSta
           setFan(AC_FAN_LOW);
           break;
         }
-      case AC_STANDBY_HIGH:
+      case AC_STATE_FAN_HIGH:
         {
           setCompressor(AC_COMPRESSOR_OFF);
           setFan(AC_FAN_HIGH);
           break;
         }
-      case AC_STANDBY_MED:
+      case AC_STATE_FAN_MED:
         {
           setCompressor(AC_COMPRESSOR_OFF);
           setFan(AC_FAN_MED);
           break;
         }
-      case AC_STANDBY_LOW:
+      case AC_STATE_FAN_LOW:
         {
           setCompressor(AC_COMPRESSOR_OFF);
           setFan(AC_FAN_LOW);
@@ -377,9 +275,9 @@ int isEvaporatorInSafeTempRange()
   switch(compressorState) 
   {
     case AC_COMPRESSOR_ON: return 
-        TEMPERATURES.getTempC(EVAP_TEMP_ADDR) > 12.0 && TEMPERATURES.getTempC(OUTLET_TEMP_ADDR) > 0.5;
+        TEMPERATURES.getTempC(EVAP_TEMP_ADDR) > 0.5 && TEMPERATURES.getTempC(OUTLET_TEMP_ADDR) > 0.5;
     case AC_COMPRESSOR_OFF: return 
-        TEMPERATURES.getTempC(EVAP_TEMP_ADDR) > 14.0 && TEMPERATURES.getTempC(OUTLET_TEMP_ADDR) > 5.0;
+        TEMPERATURES.getTempC(EVAP_TEMP_ADDR) > 5.0 && TEMPERATURES.getTempC(OUTLET_TEMP_ADDR) > 5.0;
     default: return 1; 
   }
 }
@@ -414,9 +312,9 @@ ac_state_t processCommand(const ac_state_t currentState, const ac_cmd_t command)
       // Move to STANDBY_HIGH, then to COOL_HIGH.
       switch (currentState) 
       {
-        case AC_STANDBY_HIGH: newState = AC_COOL_HIGH; break;
+        case AC_STATE_FAN_HIGH: newState = AC_COOL_HIGH; break;
         case AC_COOL_HIGH: controlCompressorState(COOL_HIGH_OFF_TEMP_C, onTempC); break;
-        default: newState = AC_STANDBY_HIGH; break;
+        default: newState = AC_STATE_FAN_HIGH; break;
       }
       break;
     }
@@ -427,9 +325,9 @@ ac_state_t processCommand(const ac_state_t currentState, const ac_cmd_t command)
       // Move to STANDBY_HIGH, then to COOL_HIGH.
       switch (currentState) 
       {
-        case AC_STANDBY_MED: newState = AC_COOL_MED; break;
+        case AC_STATE_FAN_MED: newState = AC_COOL_MED; break;
         case AC_COOL_MED: controlCompressorState(COOL_MED_OFF_TEMP_C, onTempC); break;
-        default: newState = AC_STANDBY_MED; break;
+        default: newState = AC_STATE_FAN_MED; break;
       }
       break;
     }
@@ -440,9 +338,9 @@ ac_state_t processCommand(const ac_state_t currentState, const ac_cmd_t command)
       // Move to STANDBY_HIGH, then to COOL_HIGH.
       switch (currentState) 
       {
-        case AC_STANDBY_LOW: newState = AC_COOL_LOW; break;
+        case AC_STATE_FAN_LOW: newState = AC_COOL_LOW; break;
         case AC_COOL_LOW: controlCompressorState(COOL_LOW_OFF_TEMP_C, onTempC); break;
-        default: newState = AC_STANDBY_LOW; break;
+        default: newState = AC_STATE_FAN_LOW; break;
       }
       break;
     }
@@ -451,12 +349,12 @@ ac_state_t processCommand(const ac_state_t currentState, const ac_cmd_t command)
       long elapsedStateTimeMs = millis() - lastStateChangeTimeMs;
       switch (currentState) 
       {
-        case AC_COOL_HIGH: newState = AC_STANDBY_HIGH; break;
-        case AC_COOL_MED:  newState = AC_STANDBY_MED;  break;
-        case AC_COOL_LOW:  newState = AC_STANDBY_LOW;  break;
-        case AC_STANDBY_HIGH: newState = elapsedStateTimeMs > STANDBY_HIGH_TIME_MS ? AC_STANDBY_MED : currentState; break;
-        case AC_STANDBY_MED:  newState = elapsedStateTimeMs > STANDBY_MED_TIME_MS  ? AC_STANDBY_LOW : currentState; break;
-        case AC_STANDBY_LOW:  newState = elapsedStateTimeMs > STANDBY_LOW_TIME_MS  ? AC_POWER_OFF   : currentState; break;
+        case AC_COOL_HIGH: newState = AC_STATE_FAN_HIGH; break;
+        case AC_COOL_MED:  newState = AC_STATE_FAN_MED;  break;
+        case AC_COOL_LOW:  newState = AC_STATE_FAN_LOW;  break;
+        case AC_STATE_FAN_HIGH: newState = elapsedStateTimeMs > STANDBY_HIGH_TIME_MS ? AC_STATE_FAN_MED : currentState; break;
+        case AC_STATE_FAN_MED:  newState = elapsedStateTimeMs > STANDBY_MED_TIME_MS  ? AC_STATE_FAN_LOW : currentState; break;
+        case AC_STATE_FAN_LOW:  newState = elapsedStateTimeMs > STANDBY_LOW_TIME_MS  ? AC_POWER_OFF     : currentState; break;
       }
       break;
     }
@@ -464,14 +362,16 @@ ac_state_t processCommand(const ac_state_t currentState, const ac_cmd_t command)
     {
       switch (currentState) 
       {
-        case AC_COOL_HIGH: newState = AC_STANDBY_HIGH; break;
-        case AC_COOL_MED:  newState = AC_STANDBY_MED;  break;
-        case AC_COOL_LOW:  newState = AC_STANDBY_LOW;  break;
+        case AC_COOL_HIGH: newState = AC_STATE_FAN_HIGH; break;
+        case AC_COOL_MED:  newState = AC_STATE_FAN_MED;  break;
+        case AC_COOL_LOW:  newState = AC_STATE_FAN_LOW;  break;
         default: newState = AC_POWER_OFF; break;
       }
       break; 
     }
-    case CMD_AC_FAN: newState = AC_STANDBY_HIGH; break;
+    case CMD_AC_FAN_HIGH: newState = AC_STATE_FAN_HIGH; break;
+    case CMD_AC_FAN_MED:  newState = AC_STATE_FAN_MED;  break;
+    case CMD_AC_FAN_LOW:  newState = AC_STATE_FAN_LOW;  break;
   }
 
   if (newState != currentState) {
@@ -545,52 +445,6 @@ void controlCompressorState(float offTempC, float onTempC)
       break; 
     }
   }
-}
-
-// WiFi
-
-// WIFI
-
-bool is_wifi_connected() 
-{
-  return WiFi.status() == WL_CONNECTED;
-}
-
-void wifi_connect() 
-{
-  WiFi.noLowPowerMode();
-  Serial.print("Connecting to ");
-  Serial.println(WIFI_SSID);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.noLowPowerMode();
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  int attempts = 20;
-  while (!is_wifi_connected() && (attempts--)) 
-  {
-    delay(1000);
-  }
-
-  if (!is_wifi_connected()) 
-  {
-    Serial.print("Connect failed! Rebooting.");
-    numRebootsDisconnected++; 
-    reboot(); 
-  }
-
-  Serial.println("Connected");
-  Serial.print("Connected to ");
-  Serial.println(WiFi.SSID());
-
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
-
-  Serial.print("Hostname: ");
-  Serial.print(HOSTNAME);
-  Serial.println(".local");
-
-  connectTime = millis();
 }
 
 void handleNotFound() {
