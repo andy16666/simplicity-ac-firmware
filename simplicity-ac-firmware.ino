@@ -37,6 +37,10 @@
   Author: Andrew Somerville <andy16666@gmail.com> 
   GitHub: andy16666
 */
+
+#define HOSTNAME "ac1"
+#define AC_HOSTNAME HOSTNAME
+
 #include <stdint.h>
 #include <float.h>
 #include <math.h>
@@ -51,10 +55,11 @@
 #include <aos.h>
 #include <config.h>
 #include <GPIOOutputs.h>
-#include <Thermostats.h>
 #include <SimplicityAC.h> 
 
 using namespace AOS; 
+using AOS::GPIOOutputs; 
+
 
 // Active high outputs
 #define COMPRESSOR_PIN 10
@@ -95,8 +100,8 @@ using namespace AOS;
 #define EVAP_TEMP_ADDR   61
 #define OUTLET_TEMP_ADDR 20
 
-WebServer server(80);
-SimplicityAC acData(AC_HOSTNAME);
+SimplicityAC AC(HOSTNAME);
+GPIOOutputs OUTPUTS("AC Outputs")
 
 // Internal states
 volatile ac_state_t state = AC_POWER_OFF;
@@ -109,7 +114,7 @@ volatile long lastStateChangeTimeMs = millis();
 
 const char* generateHostname()
 {
-  return "ac1"; 
+  return HOSTNAME; 
 }
 
 void aosInitialize()
@@ -119,65 +124,7 @@ void aosInitialize()
 
 void aosSetup() 
 {
-  server.begin();
-  server.on("/", []() {
-    bool success = true;
-
-    for (uint8_t i = 0; i < server.args(); i++) {
-      String argName = server.argName(i);
-      String arg = server.arg(i);
-
-      if (argName.equals("cmd") && arg.length() == 1) {
-        switch(arg.charAt(0))
-        {
-          case '-':  command = CMD_AC_OFF;  break;
-          case 'O':  command = CMD_AC_OFF;  break;
-          case 'C':  command = CMD_AC_COOL_HIGH; break;  
-          case 'H':  command = CMD_AC_COOL_HIGH; break;  
-          case 'M':  command = CMD_AC_COOL_MED; break;  
-          case 'L':  command = CMD_AC_COOL_LOW; break;  
-          case 'K':  command = CMD_AC_KILL; break;  
-          case 'F':  command = CMD_AC_FAN_HIGH;  break; 
-          case 'm':  command = CMD_AC_FAN_MED;  break; 
-          case 'l':  command = CMD_AC_FAN_LOW;  break; 
-          default:   success = false;  
-        }
-      }
-
-      if (argName.equals("bootloader") && arg.length() == 1) 
-      {
-        switch(arg.charAt(0))
-        {
-          case 'A':  rp2040.rebootToBootloader();  break;
-          default:   success = false;  
-        }
-      }
-
-      if (argName.equals("reboot") && arg.length() == 1) 
-      {
-        switch(arg.charAt(0))
-        {
-          case 'A':  reboot(); break;
-          default:   success = false;  
-        }
-      }
-    }
-
-    if (success)
-    {
-      server.send(200, "text/json", httpResponseString);
-    }
-    else 
-    {
-      server.send(500, "text/plain", "Failed to parse request.");
-    }
-  });
-
-  server.onNotFound(handleNotFound);
-  server.begin();
-  Serial.println("HTTP server started");
-
-  CORE_0_KERNEL->addImmediate(CORE_0_KERNEL, task_handleClient); 
+  
 }
 
 void aosSetup1() 
@@ -185,22 +132,17 @@ void aosSetup1()
   TEMPERATURES.add("Evap", "evapTempC", EVAP_TEMP_ADDR); 
   TEMPERATURES.add("Outlet", "outletTempC", OUTLET_TEMP_ADDR); 
 
-  pinMode(COMPRESSOR_PIN, OUTPUT);
-  digitalWrite(COMPRESSOR_PIN, LOW);
-
-  pinMode(FAN_LOW_PIN, OUTPUT);
-  digitalWrite(FAN_LOW_PIN, LOW);
-
-  pinMode(FAN_MED_PIN, OUTPUT);
-  digitalWrite(FAN_MED_PIN, LOW);
-
-  pinMode(FAN_HIGH_PIN, OUTPUT);
-  digitalWrite(FAN_HIGH_PIN, LOW);
+  OUTPUTS.add("Compressor", COMPRESSOR_PIN, true); 
+  OUTPUTS.add("Fan Low", FAN_LOW_PIN, true);
+  OUTPUTS.add("Fan Medium", FAN_MED_PIN, true);
+  OUTPUTS.add("Fan High", FAN_HIGH_PIN, true);
+  OUTPUTS.init(); 
+  OUTPUTS.setAll(); 
 
   CORE_1_KERNEL->addImmediate(CORE_1_KERNEL, task_processCommands);  
 }
 
-void populateHttpResponse(JSONVar& document) 
+void populateHttpResponse(JsonDocument& document) 
 {
   document["command"] = String((char)command).c_str(); 
   document["state"] = String((char)state).c_str(); 
@@ -208,9 +150,29 @@ void populateHttpResponse(JSONVar& document)
   document["compressorState"] = String((int)compressorState).c_str(); 
 }
 
-void task_handleClient()
+bool handleHttpArg(String argName, String arg) 
 {
-  server.handleClient(); 
+  bool success = true; 
+
+  if (argName.equals("cmd") && arg.length() == 1) 
+  {
+    switch(arg.charAt(0))
+    {
+      case '-':  command = CMD_AC_OFF;  break;
+      case 'O':  command = CMD_AC_OFF;  break;
+      case 'C':  command = CMD_AC_COOL_HIGH; break;  
+      case 'H':  command = CMD_AC_COOL_HIGH; break;  
+      case 'M':  command = CMD_AC_COOL_MED; break;  
+      case 'L':  command = CMD_AC_COOL_LOW; break;  
+      case 'K':  command = CMD_AC_KILL; break;  
+      case 'F':  command = CMD_AC_FAN_HIGH;  break; 
+      case 'm':  command = CMD_AC_FAN_MED;  break; 
+      case 'l':  command = CMD_AC_FAN_LOW;  break; 
+      default:   success = false;  
+    }
+  }
+
+  return success; 
 }
 
 void task_processCommands()
@@ -389,10 +351,12 @@ void setFan(const fan_state_t targetState)
     // Turn off the currently energized winding, if any
     switch (fanState) 
     {
-      case AC_FAN_LOW:  digitalWrite(FAN_LOW_PIN, LOW); break;
-      case AC_FAN_MED:  digitalWrite(FAN_MED_PIN, LOW); break;
-      case AC_FAN_HIGH: digitalWrite(FAN_HIGH_PIN, LOW); break;
+      case AC_FAN_LOW:  OUTPUTS.setCommand(FAN_LOW_PIN, LOW); break;
+      case AC_FAN_MED:  OUTPUTS.setCommand(FAN_MED_PIN, LOW); break;
+      case AC_FAN_HIGH: OUTPUTS.setCommand(FAN_HIGH_PIN, LOW); break;
     }
+
+    OUTPUTS.execute(); 
 
     // If transitioning from another on state, delay a brief time to allow the winding to de-energize.
     if (fanState != AC_FAN_OFF && targetState != AC_FAN_OFF)
@@ -401,10 +365,12 @@ void setFan(const fan_state_t targetState)
     // Energize the traget winding, if any
     switch (targetState) 
     {
-      case AC_FAN_LOW: digitalWrite(FAN_LOW_PIN, HIGH); break;
-      case AC_FAN_MED: digitalWrite(FAN_MED_PIN, HIGH); break;
-      case AC_FAN_HIGH: digitalWrite(FAN_HIGH_PIN, HIGH); break;
+      case AC_FAN_LOW: OUTPUTS.setCommand(FAN_LOW_PIN, HIGH); break;
+      case AC_FAN_MED: OUTPUTS.setCommand(FAN_MED_PIN, HIGH); break;
+      case AC_FAN_HIGH: OUTPUTS.setCommand(FAN_HIGH_PIN, HIGH); break;
     }
+
+    OUTPUTS.execute(); 
 
     Serial.printf("setFan: %c => %c\r\n", fanState, targetState);
     delay(TRANSITION_TIME_MS);
@@ -418,9 +384,11 @@ void setCompressor(const compressor_state_t targetState)
   {
     switch (targetState) 
     {
-      case AC_COMPRESSOR_ON:  digitalWrite(COMPRESSOR_PIN, HIGH); break;
-      case AC_COMPRESSOR_OFF: digitalWrite(COMPRESSOR_PIN, LOW); break;
+      case AC_COMPRESSOR_ON:  OUTPUTS.setCommand(COMPRESSOR_PIN, HIGH); break;
+      case AC_COMPRESSOR_OFF: OUTPUTS.setCommand(COMPRESSOR_PIN, LOW); break;
     }
+
+    OUTPUTS.execute(); 
 
     Serial.printf("setCompressor: %d => %d\r\n", compressorState, targetState);
     delay(TRANSITION_TIME_MS);
